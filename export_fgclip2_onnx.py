@@ -45,10 +45,15 @@ class ImageFeaturesWithPosEmbedInput(nn.Module):
 
     def __init__(self, model):
         super().__init__()
-        self.patch_embedding = model.vision_model.embeddings.patch_embedding
-        self.encoder = model.vision_model.encoder
-        self.post_layernorm = model.vision_model.post_layernorm
-        self.head = model.vision_model.head
+        vision_model = model.vision_model
+        self.patch_embedding = vision_model.embeddings.patch_embedding
+        self.encoder = vision_model.encoder
+        self.post_layernorm = vision_model.post_layernorm
+        head = vision_model.head
+        self.probe = head.probe
+        self.attention = head.attention
+        self.layernorm = head.layernorm
+        self.mlp = head.mlp
 
     def forward(self, pixel_values, pixel_attention_mask, pos_embed):
         hidden = self.patch_embedding(pixel_values) + pos_embed
@@ -59,8 +64,43 @@ class ImageFeaturesWithPosEmbedInput(nn.Module):
             attention_mask=attention_mask,
         ).last_hidden_state
         last_hidden_state = self.post_layernorm(last_hidden_state)
-        features = self.head(last_hidden_state, pixel_attention_mask)
+        batch_size = last_hidden_state.shape[0]
+        probe = self.probe.expand(batch_size, -1, -1)
+        features = self.pool(probe, last_hidden_state, last_hidden_state, pixel_attention_mask)
+        features = features + self.mlp(self.layernorm(features))
+        features = features[:, 0]
         return F.normalize(features, p=2, dim=-1)
+
+    def pool(self, query, key, value, pixel_attention_mask):
+        # Equivalent to nn.MultiheadAttention(batch_first=True) in the original pooling head,
+        # but written out so ONNX keeps both batch size and patch count dynamic.
+        attention = self.attention
+        batch_size = query.shape[0]
+        target_len = query.shape[1]
+        source_len = key.shape[1]
+        num_heads = attention.num_heads
+        head_dim = attention.head_dim
+        embed_dim = attention.embed_dim
+
+        q = F.linear(query, attention.in_proj_weight[:embed_dim], attention.in_proj_bias[:embed_dim])
+        k = F.linear(
+            key,
+            attention.in_proj_weight[embed_dim : 2 * embed_dim],
+            attention.in_proj_bias[embed_dim : 2 * embed_dim],
+        )
+        v = F.linear(value, attention.in_proj_weight[2 * embed_dim :], attention.in_proj_bias[2 * embed_dim :])
+
+        q = q.view(batch_size, target_len, num_heads, head_dim).transpose(1, 2)
+        k = k.view(batch_size, source_len, num_heads, head_dim).transpose(1, 2)
+        v = v.view(batch_size, source_len, num_heads, head_dim).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-1, -2)) * (head_dim**-0.5)
+        mask = (1.0 - pixel_attention_mask[:, None, None, :].to(dtype=scores.dtype))
+        scores = scores + mask * torch.finfo(scores.dtype).min
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        output = torch.matmul(probs, v)
+        output = output.transpose(1, 2).reshape(batch_size, target_len, num_heads * head_dim)
+        return F.linear(output, attention.out_proj.weight, attention.out_proj.bias)
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,7 +232,7 @@ def main() -> None:
     print("Done.")
     print(f"Text ONNX:  {text_onnx}")
     print(f"Image ONNX: {image_onnx}")
-    print("Image ONNX inputs: pixel_values [1,N,768], pixel_attention_mask [1,N], pos_embed [1,N,768]")
+    print("Image ONNX inputs: pixel_values [B,N,768], pixel_attention_mask [B,N], pos_embed [B,N,768]")
 
 
 def load_model(model_dir: Path):
@@ -267,9 +307,10 @@ def export_image_core(
         input_names=["pixel_values", "pixel_attention_mask", "pos_embed"],
         output_names=["image_features"],
         dynamic_axes={
-            "pixel_values": {1: "num_patches"},
-            "pixel_attention_mask": {1: "num_patches"},
-            "pos_embed": {1: "num_patches"},
+            "pixel_values": {0: "batch_size", 1: "num_patches"},
+            "pixel_attention_mask": {0: "batch_size", 1: "num_patches"},
+            "pos_embed": {0: "batch_size", 1: "num_patches"},
+            "image_features": {0: "batch_size"},
         },
         opset_version=opset,
         do_constant_folding=True,

@@ -21,6 +21,12 @@ End-to-end Rust run:
 cargo run --release --manifest-path .\rust-onnx-verify\Cargo.toml -- run .\images\browser_20260409_124726_272943500.jpg "山" 1024
 ```
 
+Batch image encoding:
+
+```powershell
+cargo run --release --manifest-path .\rust-onnx-verify\Cargo.toml -- run-batch 1024 .\images\a.jpg .\images\b.jpg
+```
+
 Fixture verification:
 
 From the repository root:

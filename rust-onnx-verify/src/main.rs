@@ -87,6 +87,9 @@ fn main() -> Result<()> {
     if args.first().is_some_and(|arg| arg == "run") {
         return run_end_to_end(&args[1..]);
     }
+    if args.first().is_some_and(|arg| arg == "run-batch") {
+        return run_batch(&args[1..]);
+    }
 
     let manifest_path = args
         .first()
@@ -137,6 +140,77 @@ fn main() -> Result<()> {
         dot(text_slice, image_slice)
     );
 
+    Ok(())
+}
+
+fn run_batch(args: &[std::ffi::OsString]) -> Result<()> {
+    if args.len() < 2 {
+        bail!(
+            "usage: fgclip2-onnx-verify run-batch <max-patches> <image-path> [image-path ...]"
+        );
+    }
+    let repo_root = std::env::current_dir()?;
+    let max_patches = args[0]
+        .to_string_lossy()
+        .parse::<usize>()
+        .context("run-batch first argument must be max-patches")?;
+    let paths = args[1..]
+        .iter()
+        .map(|arg| absolutize(&PathBuf::from(arg)))
+        .collect::<Result<Vec<_>>>()?;
+    let runtime = RuntimePaths::from_repo_root(&repo_root);
+
+    let start = Instant::now();
+    let mut images = Vec::with_capacity(paths.len());
+    let mut pos_embeds = Vec::with_capacity(paths.len());
+    let base_pos = read_f32_vec(&runtime.vision_pos_embedding)?;
+    for path in &paths {
+        let image = preprocess_siglip2_image(path, max_patches)
+            .with_context(|| format!("failed to preprocess {}", path.display()))?;
+        let pos_embed = make_pos_embed_no_antialias(
+            &base_pos,
+            image.spatial_height,
+            image.spatial_width,
+            max_patches,
+        )?;
+        images.push(image);
+        pos_embeds.push(pos_embed);
+    }
+    let preprocess_elapsed = start.elapsed();
+
+    let pixel_values = stack_image_pixels(&images)?;
+    let pixel_attention_mask = stack_image_masks(&images)?;
+    let pos_embed = stack_f32_arrays(&pos_embeds, &[paths.len(), max_patches, 768])?;
+
+    let mut session = load_session(&runtime.image_onnx)?;
+    let pixel_values_input = TensorRef::from_array_view(pixel_values.view())?;
+    let pixel_attention_mask_input = TensorRef::from_array_view(pixel_attention_mask.view())?;
+    let pos_embed_input = TensorRef::from_array_view(pos_embed.view())?;
+    let infer_start = Instant::now();
+    let outputs = session.run(ort::inputs![
+        "pixel_values" => pixel_values_input,
+        "pixel_attention_mask" => pixel_attention_mask_input,
+        "pos_embed" => pos_embed_input,
+    ])?;
+    let image_features = outputs["image_features"]
+        .try_extract_array::<f32>()?
+        .to_owned();
+    let infer_elapsed = infer_start.elapsed();
+
+    println!("batch size: {}", paths.len());
+    println!("max patches: {max_patches}");
+    println!("preprocess total: {:.2?}", preprocess_elapsed);
+    println!("image inference total: {:.2?}", infer_elapsed);
+    println!("image inference per image: {:.2?}", infer_elapsed / paths.len() as u32);
+    println!("output shape: {:?}", image_features.shape());
+    for (index, path) in paths.iter().enumerate() {
+        let feature = image_features.index_axis(ndarray::Axis(0), index);
+        println!(
+            "{index}: norm={:.6} {}",
+            l2(feature.as_slice().context("image output row is not contiguous")?),
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -320,6 +394,56 @@ fn preprocess_siglip2_image(image_path: &Path, max_patches: usize) -> Result<Ima
         spatial_height,
         spatial_width,
     })
+}
+
+fn stack_image_pixels(images: &[ImageInputs]) -> Result<ArrayD<f32>> {
+    let batch = images.len();
+    let max_patches = images
+        .first()
+        .context("cannot stack an empty image batch")?
+        .pixel_values
+        .shape()[1];
+    let mut values = Vec::with_capacity(batch * max_patches * 768);
+    for image in images {
+        if image.pixel_values.shape() != [1, max_patches, 768] {
+            bail!("all image pixel arrays must have shape [1,{max_patches},768]");
+        }
+        values.extend_from_slice(image.pixel_values.as_slice().context("pixel array is not contiguous")?);
+    }
+    Ok(Array::from_shape_vec(IxDyn(&[batch, max_patches, 768]), values)?)
+}
+
+fn stack_image_masks(images: &[ImageInputs]) -> Result<ArrayD<i32>> {
+    let batch = images.len();
+    let max_patches = images
+        .first()
+        .context("cannot stack an empty image batch")?
+        .pixel_attention_mask
+        .shape()[1];
+    let mut values = Vec::with_capacity(batch * max_patches);
+    for image in images {
+        if image.pixel_attention_mask.shape() != [1, max_patches] {
+            bail!("all image mask arrays must have shape [1,{max_patches}]");
+        }
+        values.extend_from_slice(
+            image
+                .pixel_attention_mask
+                .as_slice()
+                .context("mask array is not contiguous")?,
+        );
+    }
+    Ok(Array::from_shape_vec(IxDyn(&[batch, max_patches]), values)?)
+}
+
+fn stack_f32_arrays(arrays: &[ArrayD<f32>], shape: &[usize; 3]) -> Result<ArrayD<f32>> {
+    let mut values = Vec::with_capacity(shape.iter().product());
+    for array in arrays {
+        if array.shape() != [1, shape[1], shape[2]] {
+            bail!("all arrays must have shape [1,{},{}]", shape[1], shape[2]);
+        }
+        values.extend_from_slice(array.as_slice().context("array is not contiguous")?);
+    }
+    Ok(Array::from_shape_vec(IxDyn(shape), values)?)
 }
 
 fn load_rgb_image(image_path: &Path) -> Result<RgbImage> {
