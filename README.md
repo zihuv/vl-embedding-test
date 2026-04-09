@@ -28,6 +28,19 @@ uv run python app_compare_clip.py
 
 默认会在启动时加载 Chinese-CLIP 和 FG-CLIP2，并把 `images/` 预编码到内存。打开终端里打印的本地地址，然后输入自然语言搜索。
 
+如果已经导出 FG-CLIP2 ONNX / split-text 资产，可以加上 ONNX Runtime 依赖。页面会自动多出第三列 `FG-CLIP2 ONNX / split-text`：
+
+```powershell
+uv run --with onnxruntime python app_compare_clip.py
+```
+
+强制打开第三列，或测试最低内存实验版：
+
+```powershell
+uv run --with onnxruntime python app_compare_clip.py --fg-onnx-mode split-text
+uv run --with onnxruntime python app_compare_clip.py --fg-onnx-mode lowmem
+```
+
 如果启动后又往 `images/` 放了新图，点页面上的“刷新图片”。它会增量编码新文件；已有图片会复用内存里的向量。
 
 CPU 机器上可以先降低 FG-CLIP2 的图片 patch 数：

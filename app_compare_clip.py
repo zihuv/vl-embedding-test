@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 HF_CACHE_DIR = PROJECT_ROOT / ".hf-cache"
@@ -15,12 +17,23 @@ os.environ.setdefault("HF_MODULES_CACHE", str(HF_CACHE_DIR / "modules"))
 os.environ.setdefault("HF_XET_CACHE", str(HF_CACHE_DIR / "xet"))
 
 import gradio as gr
+import numpy as np
 import torch
+from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForCausalLM, AutoTokenizer
 from transformers import ChineseCLIPModel, ChineseCLIPProcessor
 
 import demo_chinese_clip
 import demo_fg_clip2
+
+
+ONNX_TEST_DIR = PROJECT_ROOT / ".onnx-wrapper-test"
+FG_ONNX_SPLIT_TEXT = ONNX_TEST_DIR / "split" / "fgclip2_text_short_b1_s64_token_embeds.onnx"
+FG_ONNX_FP32_IMAGE = ONNX_TEST_DIR / "fgclip2_image_core_posin_dynamic.onnx"
+FG_ONNX_INT8_IMAGE = ONNX_TEST_DIR / "quantized" / "fgclip2_image_core_posin_dynamic_int8.onnx"
+FG_TOKEN_EMBEDDING_F16 = ONNX_TEST_DIR / "assets" / "text_token_embedding_256000x768_f16.bin"
+FG_VISION_POS_EMBEDDING = ONNX_TEST_DIR / "assets" / "vision_pos_embedding_16x16x768_f32.bin"
+FG_LOGIT_PARAMS = ONNX_TEST_DIR / "assets" / "logit_params.json"
 
 
 @dataclass
@@ -164,6 +177,127 @@ class FgCLIP2Searcher:
         return len(new_paths)
 
 
+class FgCLIP2OnnxSearcher:
+    name = "FG-CLIP2 ONNX split-text"
+
+    def __init__(
+        self,
+        image_paths: list[Path],
+        model_dir: Path,
+        batch_size: int,
+        max_image_patches: int | None,
+        max_length: int,
+        text_onnx: Path,
+        image_onnx: Path,
+        token_embedding: Path,
+        vision_pos_embedding: Path,
+        logit_params: Path,
+    ) -> None:
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise SystemExit(
+                "onnxruntime is required for FG-CLIP2 ONNX comparison. "
+                "Run: uv run --with onnxruntime python app_compare_clip.py"
+            ) from exc
+
+        print(f"Loading {self.name}:")
+        print(f"  text ONNX:  {text_onnx}")
+        print(f"  image ONNX: {image_onnx}")
+        self.image_paths = image_paths
+        self.batch_size = batch_size
+        self.max_image_patches = max_image_patches
+        self.max_length = max_length
+        self.image_processor = AutoImageProcessor.from_pretrained(model_dir)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        self.token_embedding = np.memmap(token_embedding, dtype=np.float16, mode="r", shape=(256000, 768))
+        self.base_pos_embedding = np.fromfile(vision_pos_embedding, dtype=np.float32).reshape(16, 16, 768)
+
+        params = json.loads(logit_params.read_text(encoding="utf-8"))
+        self.logit_scale_exp = float(params["logit_scale_exp"])
+        self.logit_bias = float(params["logit_bias"])
+
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        options.intra_op_num_threads = 4
+        self.text_session = ort.InferenceSession(str(text_onnx), sess_options=options, providers=["CPUExecutionProvider"])
+        self.image_session = ort.InferenceSession(str(image_onnx), sess_options=options, providers=["CPUExecutionProvider"])
+
+        print(f"Pre-encoding images with {self.name}")
+        self.image_features = self.encode_images(image_paths)
+
+    def search(self, query: str, top_k: int) -> list[SearchResult]:
+        text_features = self.encode_text(query)
+        scores = (self.image_features @ text_features[0]).astype(np.float32)
+        scores = scores * self.logit_scale_exp + self.logit_bias
+        return rank_numpy_results(self.image_paths, scores, top_k)
+
+    def refresh_image_index(self, image_paths: list[Path]) -> int:
+        new_paths = [path for path in image_paths if path not in self.image_paths]
+        if new_paths:
+            print(f"Encoding {len(new_paths)} new images with {self.name}")
+            new_features = self.encode_images(new_paths)
+        else:
+            new_features = None
+
+        self.image_paths, self.image_features = merge_numpy_image_index(
+            self.image_paths,
+            self.image_features,
+            image_paths,
+            new_paths,
+            new_features,
+        )
+        return len(new_paths)
+
+    def encode_text(self, query: str) -> np.ndarray:
+        inputs = self.tokenizer(
+            [query.lower()],
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors="np",
+        )
+        input_ids = inputs["input_ids"].astype(np.int64, copy=False)
+        token_embeds = self.token_embedding[input_ids].astype(np.float32, copy=False)
+        features = self.text_session.run(["text_features"], {"token_embeds": token_embeds})[0].astype(np.float32)
+        return normalize_numpy(features)
+
+    def encode_images(self, image_paths: list[Path]) -> np.ndarray:
+        all_features: list[np.ndarray] = []
+        for start in range(0, len(image_paths), self.batch_size):
+            batch_paths = image_paths[start : start + self.batch_size]
+            images = [Image.open(path).convert("RGB") for path in batch_paths]
+            try:
+                max_num_patches = max(demo_fg_clip2.determine_max_patches(image) for image in images)
+                if self.max_image_patches is not None:
+                    max_num_patches = min(max_num_patches, self.max_image_patches)
+                inputs = self.image_processor(
+                    images=images,
+                    max_num_patches=max_num_patches,
+                    return_tensors="np",
+                )
+            finally:
+                for image in images:
+                    image.close()
+
+            pixel_values = inputs["pixel_values"].astype(np.float32, copy=False)
+            pixel_attention_mask = inputs["pixel_attention_mask"].astype(np.int32, copy=False)
+            spatial_shapes = inputs["spatial_shapes"]
+            pos_embed = make_onnx_pos_embed(self.base_pos_embedding, spatial_shapes, pixel_values.shape[1])
+            features = self.image_session.run(
+                ["image_features"],
+                {
+                    "pixel_values": pixel_values,
+                    "pixel_attention_mask": pixel_attention_mask,
+                    "pos_embed": pos_embed,
+                },
+            )[0].astype(np.float32)
+            all_features.append(normalize_numpy(features))
+            print(f"Encoded ONNX images {min(start + self.batch_size, len(image_paths))}/{len(image_paths)}")
+
+        return np.concatenate(all_features, axis=0)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare Chinese-CLIP and FG-CLIP2 with Gradio.")
     parser.add_argument("--image-dir", type=Path, default=PROJECT_ROOT / "images")
@@ -174,6 +308,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fg-max-image-patches", type=int, default=None)
     parser.add_argument("--fg-max-length", type=int, default=64)
     parser.add_argument("--fg-walk-type", choices=["short", "long"], default="short")
+    parser.add_argument("--fg-onnx-mode", choices=["auto", "disabled", "split-text", "lowmem"], default="auto")
+    parser.add_argument("--fg-onnx-batch-size", type=int, default=1)
+    parser.add_argument("--fg-onnx-max-image-patches", type=int, default=None)
+    parser.add_argument("--fg-onnx-text", type=Path, default=FG_ONNX_SPLIT_TEXT)
+    parser.add_argument("--fg-onnx-image", type=Path, default=None)
+    parser.add_argument("--fg-token-embedding", type=Path, default=FG_TOKEN_EMBEDDING_F16)
+    parser.add_argument("--fg-vision-pos-embedding", type=Path, default=FG_VISION_POS_EMBEDDING)
+    parser.add_argument("--fg-logit-params", type=Path, default=FG_LOGIT_PARAMS)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--server-name", default="127.0.0.1")
     parser.add_argument("--server-port", type=int, default=7860)
@@ -189,6 +331,13 @@ def rank_results(image_paths: list[Path], scores: torch.Tensor, top_k: int) -> l
     for index in ranking.indices.tolist():
         results.append(SearchResult(path=image_paths[index], score=scores[index].item()))
     return results
+
+
+def rank_numpy_results(image_paths: list[Path], scores: np.ndarray, top_k: int) -> list[SearchResult]:
+    scores = scores.reshape(-1)
+    top_k = min(top_k, len(image_paths))
+    ranking = np.argsort(-scores)[:top_k]
+    return [SearchResult(path=image_paths[int(index)], score=float(scores[int(index)])) for index in ranking]
 
 
 def merge_image_index(
@@ -211,6 +360,66 @@ def merge_image_index(
     return list(target_paths), merged_features
 
 
+def merge_numpy_image_index(
+    old_paths: list[Path],
+    old_features: np.ndarray,
+    target_paths: list[Path],
+    new_paths: list[Path],
+    new_features: np.ndarray | None,
+) -> tuple[list[Path], np.ndarray]:
+    features_by_path = {path: old_features[index] for index, path in enumerate(old_paths)}
+    if new_features is not None:
+        for index, path in enumerate(new_paths):
+            features_by_path[path] = new_features[index]
+
+    merged_features = np.stack([features_by_path[path] for path in target_paths], axis=0).astype(np.float32)
+    return list(target_paths), merged_features
+
+
+def normalize_numpy(features: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(features, axis=-1, keepdims=True)
+    return features / np.maximum(norms, np.finfo(np.float32).tiny)
+
+
+def make_onnx_pos_embed(
+    base_pos_embedding: np.ndarray,
+    spatial_shapes: np.ndarray,
+    max_patches: int,
+) -> np.ndarray:
+    batch = int(spatial_shapes.shape[0])
+    pos_embed = np.zeros((batch, max_patches, 768), dtype=np.float32)
+    for index, shape in enumerate(spatial_shapes.tolist()):
+        height, width = int(shape[0]), int(shape[1])
+        resized = resize_pos_embedding_no_antialias(base_pos_embedding, height, width)
+        patch_count = min(height * width, max_patches)
+        pos_embed[index, :patch_count, :] = resized.reshape(-1, 768)[:patch_count]
+    return pos_embed
+
+
+def resize_pos_embedding_no_antialias(base_pos_embedding: np.ndarray, height: int, width: int) -> np.ndarray:
+    output = np.empty((height, width, 768), dtype=np.float32)
+    source_height, source_width = base_pos_embedding.shape[:2]
+    for y in range(height):
+        source_y = linear_source_coordinate(y, height, source_height)
+        y0 = int(np.floor(source_y))
+        y1 = min(y0 + 1, source_height - 1)
+        wy = source_y - y0
+        for x in range(width):
+            source_x = linear_source_coordinate(x, width, source_width)
+            x0 = int(np.floor(source_x))
+            x1 = min(x0 + 1, source_width - 1)
+            wx = source_x - x0
+            top = base_pos_embedding[y0, x0] + (base_pos_embedding[y0, x1] - base_pos_embedding[y0, x0]) * wx
+            bottom = base_pos_embedding[y1, x0] + (base_pos_embedding[y1, x1] - base_pos_embedding[y1, x0]) * wx
+            output[y, x] = top + (bottom - top) * wy
+    return output
+
+
+def linear_source_coordinate(output_index: int, output_size: int, input_size: int) -> float:
+    source = (output_index + 0.5) * input_size / output_size - 0.5
+    return min(max(source, 0.0), input_size - 1.0)
+
+
 def gallery_items(results: list[SearchResult]) -> list[tuple[str, str]]:
     return [
         (str(result.path), f"{rank}. {result.score:.4f} | {result.path.name}")
@@ -228,6 +437,7 @@ def table_rows(results: list[SearchResult]) -> list[list[str | float | int]]:
 def build_demo(
     chinese_searcher: ChineseCLIPSearcher,
     fg_searcher: FgCLIP2Searcher,
+    fg_onnx_searcher: FgCLIP2OnnxSearcher | None,
     image_dir: Path,
     default_top_k: int,
     device: torch.device,
@@ -243,15 +453,18 @@ def build_demo(
         with index_lock:
             chinese_results = chinese_searcher.search(query, top_k)
             fg_results = fg_searcher.search(query, top_k)
+            fg_onnx_results = fg_onnx_searcher.search(query, top_k) if fg_onnx_searcher is not None else None
             status = f"query: {query} | images: {len(chinese_searcher.image_paths)} | device: {device}"
 
-        return (
+        outputs: tuple[Any, ...] = (
             gallery_items(chinese_results),
             table_rows(chinese_results),
             gallery_items(fg_results),
             table_rows(fg_results),
-            status,
         )
+        if fg_onnx_results is not None:
+            outputs += (gallery_items(fg_onnx_results), table_rows(fg_onnx_results))
+        return (*outputs, status)
 
     def refresh_and_search(query: str, top_k: int):
         query = query.strip() or "山"
@@ -263,12 +476,17 @@ def build_demo(
 
             chinese_added = chinese_searcher.refresh_image_index(image_paths)
             fg_added = fg_searcher.refresh_image_index(image_paths)
+            fg_onnx_added = (
+                fg_onnx_searcher.refresh_image_index(image_paths) if fg_onnx_searcher is not None else None
+            )
             outputs = search(query, int(top_k))
 
         status = (
             f"{outputs[-1]} | refreshed: Chinese-CLIP +{chinese_added}, "
             f"FG-CLIP2 +{fg_added}"
         )
+        if fg_onnx_added is not None:
+            status += f", FG-CLIP2 ONNX +{fg_onnx_added}"
         return (*outputs[:-1], status)
 
     image_count = len(chinese_searcher.image_paths)
@@ -303,7 +521,21 @@ def build_demo(
                     interactive=False,
                 )
 
-        outputs = [chinese_gallery, chinese_table, fg_gallery, fg_table, status]
+            if fg_onnx_searcher is not None:
+                with gr.Column():
+                    gr.Markdown("## FG-CLIP2 ONNX / split-text")
+                    fg_onnx_gallery = gr.Gallery(label="排序结果", columns=4, height=520, object_fit="cover")
+                    fg_onnx_table = gr.Dataframe(
+                        headers=["rank", "filename", "score", "path"],
+                        datatype=["number", "str", "number", "str"],
+                        label="排名",
+                        interactive=False,
+                    )
+
+        outputs = [chinese_gallery, chinese_table, fg_gallery, fg_table]
+        if fg_onnx_searcher is not None:
+            outputs.extend([fg_onnx_gallery, fg_onnx_table])
+        outputs.append(status)
         demo.load(search, inputs=[query, top_k], outputs=outputs)
         search_button.click(search, inputs=[query, top_k], outputs=outputs)
         refresh_button.click(refresh_and_search, inputs=[query, top_k], outputs=outputs)
@@ -315,6 +547,65 @@ def build_demo(
         )
 
     return demo
+
+
+def build_fg_onnx_searcher(
+    args: argparse.Namespace,
+    image_paths: list[Path],
+) -> FgCLIP2OnnxSearcher | None:
+    mode = args.fg_onnx_mode
+    if mode == "disabled":
+        return None
+
+    image_onnx = args.fg_onnx_image
+    if image_onnx is None:
+        image_onnx = FG_ONNX_INT8_IMAGE if mode == "lowmem" else FG_ONNX_FP32_IMAGE
+
+    required_assets = [
+        args.fg_onnx_text,
+        image_onnx,
+        args.fg_token_embedding,
+        args.fg_vision_pos_embedding,
+        args.fg_logit_params,
+    ]
+    missing_assets = [path for path in required_assets if not path.exists()]
+    if missing_assets:
+        if mode == "auto":
+            print("Skipping FG-CLIP2 ONNX comparison; missing assets:")
+            for path in missing_assets:
+                print(f"  {path}")
+            return None
+        raise SystemExit("Missing FG-CLIP2 ONNX assets:\n" + "\n".join(f"  {path}" for path in missing_assets))
+
+    if mode == "auto" and not python_package_available("onnxruntime"):
+        print("Skipping FG-CLIP2 ONNX comparison; onnxruntime is not installed.")
+        print("Run with: uv run --with onnxruntime python app_compare_clip.py")
+        return None
+
+    return FgCLIP2OnnxSearcher(
+        image_paths=image_paths,
+        model_dir=args.fg_model_dir,
+        batch_size=args.fg_onnx_batch_size,
+        max_image_patches=(
+            args.fg_onnx_max_image_patches
+            if args.fg_onnx_max_image_patches is not None
+            else args.fg_max_image_patches
+        ),
+        max_length=args.fg_max_length,
+        text_onnx=args.fg_onnx_text,
+        image_onnx=image_onnx,
+        token_embedding=args.fg_token_embedding,
+        vision_pos_embedding=args.fg_vision_pos_embedding,
+        logit_params=args.fg_logit_params,
+    )
+
+
+def python_package_available(package: str) -> bool:
+    try:
+        __import__(package)
+    except ImportError:
+        return False
+    return True
 
 
 def main() -> None:
@@ -345,8 +636,9 @@ def main() -> None:
         walk_type=args.fg_walk_type,
         device=device,
     )
+    fg_onnx_searcher = build_fg_onnx_searcher(args, image_paths)
 
-    demo = build_demo(chinese_searcher, fg_searcher, args.image_dir, args.top_k, device)
+    demo = build_demo(chinese_searcher, fg_searcher, fg_onnx_searcher, args.image_dir, args.top_k, device)
     demo.queue().launch(
         server_name=args.server_name,
         server_port=args.server_port,

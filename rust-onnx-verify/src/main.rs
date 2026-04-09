@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -71,9 +72,32 @@ struct ImageInputs {
 
 impl RuntimePaths {
     fn from_repo_root(root: &Path) -> Self {
+        let variant = std::env::var("FGCLIP2_RUNTIME_VARIANT").unwrap_or_default();
+        let use_dynamic_int8 = matches!(
+            variant.as_str(),
+            "dynamic-int8" | "dynamic_int8" | "int8" | "quantized"
+        );
+        let use_split_text = matches!(
+            variant.as_str(),
+            "lowmem" | "low-memory" | "split-text" | "split_text"
+        );
+        let use_quantized_image = use_dynamic_int8 || matches!(variant.as_str(), "lowmem" | "low-memory");
+        let text_default = if use_dynamic_int8 {
+            ".onnx-wrapper-test/quantized/fgclip2_text_short_b1_s64_dynamic_int8.onnx"
+        } else if use_split_text {
+            ".onnx-wrapper-test/split/fgclip2_text_short_b1_s64_token_embeds.onnx"
+        } else {
+            ".onnx-wrapper-test/fgclip2_text_short_b1_s64.onnx"
+        };
+        let image_default = if use_quantized_image {
+            ".onnx-wrapper-test/quantized/fgclip2_image_core_posin_dynamic_int8.onnx"
+        } else {
+            ".onnx-wrapper-test/fgclip2_image_core_posin_dynamic.onnx"
+        };
+
         Self {
-            text_onnx: root.join(".onnx-wrapper-test/fgclip2_text_short_b1_s64.onnx"),
-            image_onnx: root.join(".onnx-wrapper-test/fgclip2_image_core_posin_dynamic.onnx"),
+            text_onnx: env_path_or_default(root, "FGCLIP2_TEXT_ONNX", text_default),
+            image_onnx: env_path_or_default(root, "FGCLIP2_IMAGE_ONNX", image_default),
             vision_pos_embedding: root
                 .join(".onnx-wrapper-test/assets/vision_pos_embedding_16x16x768_f32.bin"),
             logit_params: root.join(".onnx-wrapper-test/assets/logit_params.json"),
@@ -82,10 +106,26 @@ impl RuntimePaths {
     }
 }
 
+fn env_path_or_default(root: &Path, env_key: &str, default_relative: &str) -> PathBuf {
+    if let Some(value) = std::env::var_os(env_key) {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+    } else {
+        root.join(default_relative)
+    }
+}
+
 fn main() -> Result<()> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == "run") {
         return run_end_to_end(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "run-text") {
+        return run_text_only(&args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "run-batch") {
         return run_batch(&args[1..]);
@@ -140,6 +180,31 @@ fn main() -> Result<()> {
         dot(text_slice, image_slice)
     );
 
+    Ok(())
+}
+
+fn run_text_only(args: &[std::ffi::OsString]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: fgclip2-onnx-verify run-text <query>");
+    }
+    let repo_root = std::env::current_dir()?;
+    let runtime = RuntimePaths::from_repo_root(&repo_root);
+    let query = args[0].to_string_lossy().to_lowercase();
+    println!("query: {query}");
+
+    let input_ids = tokenize_query(&runtime.tokenizer_json, &query, 64)?;
+    let text_features = run_text(&runtime.text_onnx, &input_ids)?;
+    let text = text_features
+        .as_slice()
+        .context("text output is not contiguous")?;
+    println!("text norm: {:.6}", l2(text));
+    if let Some(dump_dir) = std::env::var_os("FGCLIP2_DUMP_DIR").map(PathBuf::from) {
+        fs::create_dir_all(&dump_dir)
+            .with_context(|| format!("failed to create {}", dump_dir.display()))?;
+        dump_array_i64(&dump_dir.join("input_ids_i64.bin"), &input_ids)?;
+        write_f32_slice(&dump_dir.join("text_features_f32.bin"), text)?;
+        println!("dumped text features -> {}", dump_dir.display());
+    }
     Ok(())
 }
 
@@ -282,15 +347,133 @@ fn run_end_to_end(args: &[std::ffi::OsString]) -> Result<()> {
 
 fn run_text(model_path: &Path, input_ids: &ArrayD<i64>) -> Result<ArrayD<f32>> {
     let mut session = load_session(model_path)?;
-    let input_ids = TensorRef::from_array_view(input_ids.view())?;
+    let token_embedding_path = text_token_embedding_path_for(model_path);
+
     let start = Instant::now();
-    let outputs = session.run(ort::inputs!["input_ids" => input_ids])?;
+    let outputs = if let Some(token_embedding_path) = token_embedding_path {
+        let token_embeds = gather_text_token_embeddings(&token_embedding_path, input_ids)?;
+        let token_embeds = TensorRef::from_array_view(token_embeds.view())?;
+        session.run(ort::inputs!["token_embeds" => token_embeds])?
+    } else {
+        let input_ids = TensorRef::from_array_view(input_ids.view())?;
+        session.run(ort::inputs!["input_ids" => input_ids])?
+    };
     let elapsed = start.elapsed();
     let features = outputs["text_features"]
         .try_extract_array::<f32>()?
         .to_owned();
     println!("text inference: {:.2?}", elapsed);
     Ok(features)
+}
+
+fn text_token_embedding_path_for(model_path: &Path) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FGCLIP2_TEXT_TOKEN_EMBEDDING").map(PathBuf::from) {
+        return Some(path);
+    }
+    let file_name = model_path.file_name()?.to_string_lossy();
+    if !file_name.contains("token_embeds") {
+        return None;
+    }
+    let onnx_dir = model_path.parent()?.parent()?;
+    Some(onnx_dir.join("assets/text_token_embedding_256000x768_f16.bin"))
+}
+
+fn gather_text_token_embeddings(
+    embedding_path: &Path,
+    input_ids: &ArrayD<i64>,
+) -> Result<ArrayD<f32>> {
+    let shape = input_ids.shape();
+    if shape.len() != 2 {
+        bail!("input_ids must have shape [B,S], got {:?}", shape);
+    }
+    let input_ids = input_ids.as_slice().context("input ids are not contiguous")?;
+    let dtype = text_token_embedding_dtype(embedding_path);
+    let row_bytes = dtype.bytes_per_value() * 768;
+    let token_count = fs::metadata(embedding_path)
+        .with_context(|| format!("failed to stat {}", embedding_path.display()))?
+        .len()
+        / row_bytes as u64;
+    let mut file = fs::File::open(embedding_path)
+        .with_context(|| format!("failed to open {}", embedding_path.display()))?;
+    let mut row_bytes_buffer = vec![0u8; row_bytes];
+    let mut values = vec![0.0f32; input_ids.len() * 768];
+
+    for (token_index, token_id) in input_ids.iter().enumerate() {
+        if *token_id < 0 || *token_id as u64 >= token_count {
+            bail!(
+                "token id {token_id} is outside embedding table with {token_count} rows"
+            );
+        }
+        file.seek(SeekFrom::Start(*token_id as u64 * row_bytes as u64))?;
+        file.read_exact(&mut row_bytes_buffer)?;
+        let output = &mut values[token_index * 768..(token_index + 1) * 768];
+        match dtype {
+            TextTokenEmbeddingDtype::F16 => {
+                for (value, bytes) in output.iter_mut().zip(row_bytes_buffer.chunks_exact(2)) {
+                    *value = f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+                }
+            }
+            TextTokenEmbeddingDtype::F32 => {
+                for (value, bytes) in output.iter_mut().zip(row_bytes_buffer.chunks_exact(4)) {
+                    *value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                }
+            }
+        }
+    }
+
+    Ok(Array::from_shape_vec(
+        IxDyn(&[shape[0], shape[1], 768]),
+        values,
+    )?)
+}
+
+#[derive(Clone, Copy)]
+enum TextTokenEmbeddingDtype {
+    F16,
+    F32,
+}
+
+impl TextTokenEmbeddingDtype {
+    fn bytes_per_value(self) -> usize {
+        match self {
+            TextTokenEmbeddingDtype::F16 => 2,
+            TextTokenEmbeddingDtype::F32 => 4,
+        }
+    }
+}
+
+fn text_token_embedding_dtype(path: &Path) -> TextTokenEmbeddingDtype {
+    if std::env::var("FGCLIP2_TEXT_TOKEN_EMBEDDING_DTYPE")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("f32"))
+        || path.to_string_lossy().contains("_f32")
+    {
+        TextTokenEmbeddingDtype::F32
+    } else {
+        TextTokenEmbeddingDtype::F16
+    }
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exponent = (bits >> 10) & 0x1f;
+    let fraction = bits & 0x03ff;
+
+    let f32_bits = match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let mut fraction = fraction as u32;
+            let mut exponent = -14i32;
+            while fraction & 0x0400 == 0 {
+                fraction <<= 1;
+                exponent -= 1;
+            }
+            fraction &= 0x03ff;
+            sign | (((exponent + 127) as u32) << 23) | (fraction << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | ((fraction as u32) << 13),
+        _ => sign | (((exponent as u32) + 112) << 23) | ((fraction as u32) << 13),
+    };
+    f32::from_bits(f32_bits)
 }
 
 fn run_image(
