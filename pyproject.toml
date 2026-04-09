@@ -1,0 +1,15 @@
+[project]
+name = "vl-embedding-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gradio>=6.11.0",
+    "huggingface-hub>=1.9.2",
+    "pillow>=12.2.0",
+    "qwen-vl-utils>=0.0.14",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "transformers>=4.57.0",
+]
