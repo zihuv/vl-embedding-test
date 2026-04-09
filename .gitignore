@@ -16,3 +16,8 @@ images/
 
 # Local app logs
 .gradio.*.log
+
+# Local ONNX/Rust verification outputs
+.onnx-wrapper-test/
+.onnx-script-test/
+rust-onnx-verify/target/
