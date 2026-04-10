@@ -21,10 +21,12 @@ from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForCausalLM, AutoTokenizer
 
 import demo_fg_clip2
+import project_layout
 
-
-DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "fg-clip2-base"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / ".onnx-wrapper-test"
+FG_LAYOUT = project_layout.FGCLIP2_LAYOUT
+DEFAULT_MODEL_DIR = project_layout.source_model_dir("fg-clip2-base")
+DEFAULT_OUTPUT_DIR = FG_LAYOUT.runtime_root
+DEFAULT_FIXTURE_DIR = FG_LAYOUT.fixtures_root
 DEFAULT_IMAGE = PROJECT_ROOT / "images" / "browser_20260409_124726_272943500.jpg"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 
@@ -122,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-verify", action="store_true")
     parser.add_argument("--write-fixture", action="store_true")
     parser.add_argument("--skip-assets", action="store_true")
-    parser.add_argument("--fixture-dir", type=Path, default=None)
+    parser.add_argument("--fixture-dir", type=Path, default=DEFAULT_FIXTURE_DIR)
     return parser.parse_args()
 
 
@@ -213,10 +215,9 @@ def main() -> None:
         write_runtime_assets(model, output_dir)
 
     if args.write_fixture:
-        fixture_dir = args.fixture_dir or output_dir / "fixtures"
         write_fixture(
             output_dir=output_dir,
-            fixture_dir=fixture_dir.resolve(),
+            fixture_dir=args.fixture_dir.resolve(),
             text_onnx=text_onnx,
             image_onnx=image_onnx,
             query=args.query,

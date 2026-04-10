@@ -77,31 +77,37 @@ impl RuntimePaths {
             variant.as_str(),
             "dynamic-int8" | "dynamic_int8" | "int8" | "quantized"
         );
-        let use_split_text = matches!(
+        let use_full_text = matches!(
             variant.as_str(),
-            "lowmem" | "low-memory" | "split-text" | "split_text"
+            "baseline" | "full-text" | "full_text" | "full-fp32" | "full_fp32" | "fp32"
         );
-        let use_quantized_image = use_dynamic_int8 || matches!(variant.as_str(), "lowmem" | "low-memory");
+        let use_split_text = !use_full_text
+            || matches!(
+                variant.as_str(),
+                "lowmem" | "low-memory" | "split-text" | "split_text"
+            );
+        let use_quantized_image =
+            use_dynamic_int8 || matches!(variant.as_str(), "lowmem" | "low-memory");
         let text_default = if use_dynamic_int8 {
-            ".onnx-wrapper-test/quantized/fgclip2_text_short_b1_s64_dynamic_int8.onnx"
+            "artifacts/fgclip2/runtime/quantized/fgclip2_text_short_b1_s64_dynamic_int8.onnx"
         } else if use_split_text {
-            ".onnx-wrapper-test/split/fgclip2_text_short_b1_s64_token_embeds.onnx"
+            "artifacts/fgclip2/runtime/split/fgclip2_text_short_b1_s64_token_embeds.onnx"
         } else {
-            ".onnx-wrapper-test/fgclip2_text_short_b1_s64.onnx"
+            "artifacts/fgclip2/runtime/fgclip2_text_short_b1_s64.onnx"
         };
         let image_default = if use_quantized_image {
-            ".onnx-wrapper-test/quantized/fgclip2_image_core_posin_dynamic_int8.onnx"
+            "artifacts/fgclip2/runtime/quantized/fgclip2_image_core_posin_dynamic_int8.onnx"
         } else {
-            ".onnx-wrapper-test/fgclip2_image_core_posin_dynamic.onnx"
+            "artifacts/fgclip2/runtime/fgclip2_image_core_posin_dynamic.onnx"
         };
 
         Self {
             text_onnx: env_path_or_default(root, "FGCLIP2_TEXT_ONNX", text_default),
             image_onnx: env_path_or_default(root, "FGCLIP2_IMAGE_ONNX", image_default),
             vision_pos_embedding: root
-                .join(".onnx-wrapper-test/assets/vision_pos_embedding_16x16x768_f32.bin"),
-            logit_params: root.join(".onnx-wrapper-test/assets/logit_params.json"),
-            tokenizer_json: root.join("models/fg-clip2-base/tokenizer.json"),
+                .join("artifacts/fgclip2/runtime/assets/vision_pos_embedding_16x16x768_f32.bin"),
+            logit_params: root.join("artifacts/fgclip2/runtime/assets/logit_params.json"),
+            tokenizer_json: root.join("models/source/fg-clip2-base/tokenizer.json"),
         }
     }
 }
@@ -134,14 +140,10 @@ fn main() -> Result<()> {
     let manifest_path = args
         .first()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("../.onnx-wrapper-test/fixtures/manifest.json"));
+        .unwrap_or_else(default_manifest_path);
     let manifest_path = absolutize(&manifest_path)?;
-    let repo_root = manifest_path
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .context("manifest must be inside .onnx-wrapper-test/fixtures")?
-        .to_path_buf();
+    let repo_root =
+        repo_root_from_manifest(&manifest_path).context("manifest must be inside artifacts/fgclip2/fixtures")?;
 
     let manifest: Manifest = serde_json::from_slice(
         &fs::read(&manifest_path)
@@ -150,7 +152,10 @@ fn main() -> Result<()> {
     .context("failed to parse manifest JSON")?;
 
     println!("manifest: {}", manifest_path.display());
-    println!("reference text/image cosine: {:.8}", manifest.expected.text_image_cosine);
+    println!(
+        "reference text/image cosine: {:.8}",
+        manifest.expected.text_image_cosine
+    );
 
     let text_input = read_i64_array(&repo_root, &manifest.tensors.input_ids)?;
     let text_ref = read_f32_array(&repo_root, &manifest.tensors.text_ref)?;
@@ -159,10 +164,7 @@ fn main() -> Result<()> {
     let image_pos_embed = read_f32_array(&repo_root, &manifest.tensors.pos_embed)?;
     let image_ref = read_f32_array(&repo_root, &manifest.tensors.image_ref)?;
 
-    let text_out = run_text(
-        &repo_root.join(&manifest.onnx.text),
-        &text_input,
-    )?;
+    let text_out = run_text(&repo_root.join(&manifest.onnx.text), &text_input)?;
     report("text", &text_out, &text_ref)?;
 
     let image_out = run_image(
@@ -173,14 +175,47 @@ fn main() -> Result<()> {
     )?;
     report("image", &image_out, &image_ref)?;
 
-    let text_slice = text_out.as_slice().context("text output is not contiguous")?;
-    let image_slice = image_out.as_slice().context("image output is not contiguous")?;
+    let text_slice = text_out
+        .as_slice()
+        .context("text output is not contiguous")?;
+    let image_slice = image_out
+        .as_slice()
+        .context("image output is not contiguous")?;
     println!(
         "rust text/image cosine: {:.8}",
         dot(text_slice, image_slice)
     );
 
     Ok(())
+}
+
+fn default_manifest_path() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let candidates = [
+        cwd.join("artifacts/fgclip2/fixtures/manifest.json"),
+        cwd.join("../artifacts/fgclip2/fixtures/manifest.json"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    cwd.join("artifacts/fgclip2/fixtures/manifest.json")
+}
+
+fn repo_root_from_manifest(manifest_path: &Path) -> Option<PathBuf> {
+    for ancestor in manifest_path.ancestors() {
+        if ancestor.file_name().is_some_and(|name| name == "fixtures") {
+            let parent = ancestor.parent()?;
+            if parent.file_name().is_some_and(|name| name == "fgclip2") {
+                let artifacts = parent.parent()?;
+                if artifacts.file_name().is_some_and(|name| name == "artifacts") {
+                    return artifacts.parent().map(Path::to_path_buf);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn run_text_only(args: &[std::ffi::OsString]) -> Result<()> {
@@ -210,9 +245,7 @@ fn run_text_only(args: &[std::ffi::OsString]) -> Result<()> {
 
 fn run_batch(args: &[std::ffi::OsString]) -> Result<()> {
     if args.len() < 2 {
-        bail!(
-            "usage: fgclip2-onnx-verify run-batch <max-patches> <image-path> [image-path ...]"
-        );
+        bail!("usage: fgclip2-onnx-verify run-batch <max-patches> <image-path> [image-path ...]");
     }
     let repo_root = std::env::current_dir()?;
     let max_patches = args[0]
@@ -266,13 +299,18 @@ fn run_batch(args: &[std::ffi::OsString]) -> Result<()> {
     println!("max patches: {max_patches}");
     println!("preprocess total: {:.2?}", preprocess_elapsed);
     println!("image inference total: {:.2?}", infer_elapsed);
-    println!("image inference per image: {:.2?}", infer_elapsed / paths.len() as u32);
+    println!(
+        "image inference per image: {:.2?}",
+        infer_elapsed / paths.len() as u32
+    );
     println!("output shape: {:?}", image_features.shape());
     for (index, path) in paths.iter().enumerate() {
         let feature = image_features.index_axis(ndarray::Axis(0), index);
         println!(
             "{index}: norm={:.6} {}",
-            l2(feature.as_slice().context("image output row is not contiguous")?),
+            l2(feature
+                .as_slice()
+                .context("image output row is not contiguous")?),
             path.display()
         );
     }
@@ -317,21 +355,28 @@ fn run_end_to_end(args: &[std::ffi::OsString]) -> Result<()> {
         &image_inputs.pixel_attention_mask,
         &pos_embed,
     )?;
-    let text = text_features.as_slice().context("text output is not contiguous")?;
-    let image = image_features.as_slice().context("image output is not contiguous")?;
+    let text = text_features
+        .as_slice()
+        .context("text output is not contiguous")?;
+    let image = image_features
+        .as_slice()
+        .context("image output is not contiguous")?;
 
     let cosine = dot(text, image);
-    let logit_params: LogitParams =
-        serde_json::from_slice(&fs::read(&runtime.logit_params).with_context(|| {
-            format!("failed to read {}", runtime.logit_params.display())
-        })?)?;
+    let logit_params: LogitParams = serde_json::from_slice(
+        &fs::read(&runtime.logit_params)
+            .with_context(|| format!("failed to read {}", runtime.logit_params.display()))?,
+    )?;
     let logit = cosine * logit_params.logit_scale_exp + logit_params.logit_bias;
     println!("cosine: {cosine:.8}");
     println!("logit:  {logit:.8}");
     if let Some(dump_dir) = std::env::var_os("FGCLIP2_DUMP_DIR").map(PathBuf::from) {
         fs::create_dir_all(&dump_dir)
             .with_context(|| format!("failed to create {}", dump_dir.display()))?;
-        dump_array_f32(&dump_dir.join("pixel_values_f32.bin"), &image_inputs.pixel_values)?;
+        dump_array_f32(
+            &dump_dir.join("pixel_values_f32.bin"),
+            &image_inputs.pixel_values,
+        )?;
         dump_array_i32(
             &dump_dir.join("pixel_attention_mask_i32.bin"),
             &image_inputs.pixel_attention_mask,
@@ -386,7 +431,9 @@ fn gather_text_token_embeddings(
     if shape.len() != 2 {
         bail!("input_ids must have shape [B,S], got {:?}", shape);
     }
-    let input_ids = input_ids.as_slice().context("input ids are not contiguous")?;
+    let input_ids = input_ids
+        .as_slice()
+        .context("input ids are not contiguous")?;
     let dtype = text_token_embedding_dtype(embedding_path);
     let row_bytes = dtype.bytes_per_value() * 768;
     let token_count = fs::metadata(embedding_path)
@@ -400,9 +447,7 @@ fn gather_text_token_embeddings(
 
     for (token_index, token_id) in input_ids.iter().enumerate() {
         if *token_id < 0 || *token_id as u64 >= token_count {
-            bail!(
-                "token id {token_id} is outside embedding table with {token_count} rows"
-            );
+            bail!("token id {token_id} is outside embedding table with {token_count} rows");
         }
         file.seek(SeekFrom::Start(*token_id as u64 * row_bytes as u64))?;
         file.read_exact(&mut row_bytes_buffer)?;
@@ -533,8 +578,12 @@ fn tokenize_query(tokenizer_path: &Path, query: &str, max_len: usize) -> Result<
 fn preprocess_siglip2_image(image_path: &Path, max_patches: usize) -> Result<ImageInputs> {
     let image = load_rgb_image(image_path)?;
     let (original_width, original_height) = image.dimensions();
-    let (target_height, target_width) =
-        get_image_size_for_max_num_patches(original_height as usize, original_width as usize, 16, max_patches);
+    let (target_height, target_width) = get_image_size_for_max_num_patches(
+        original_height as usize,
+        original_width as usize,
+        16,
+        max_patches,
+    );
     let resized = image::imageops::resize(
         &image,
         target_width as u32,
@@ -556,7 +605,8 @@ fn preprocess_siglip2_image(image_path: &Path, max_patches: usize) -> Result<Ima
             let mut dst = patch_base;
             for y in 0..16 {
                 for x in 0..16 {
-                    let pixel = resized.get_pixel((patch_x * 16 + x) as u32, (patch_y * 16 + y) as u32);
+                    let pixel =
+                        resized.get_pixel((patch_x * 16 + x) as u32, (patch_y * 16 + y) as u32);
                     for channel in 0..3 {
                         pixel_values[dst] = pixel[channel] as f32 / 127.5 - 1.0;
                         dst += 1;
@@ -591,9 +641,17 @@ fn stack_image_pixels(images: &[ImageInputs]) -> Result<ArrayD<f32>> {
         if image.pixel_values.shape() != [1, max_patches, 768] {
             bail!("all image pixel arrays must have shape [1,{max_patches},768]");
         }
-        values.extend_from_slice(image.pixel_values.as_slice().context("pixel array is not contiguous")?);
+        values.extend_from_slice(
+            image
+                .pixel_values
+                .as_slice()
+                .context("pixel array is not contiguous")?,
+        );
     }
-    Ok(Array::from_shape_vec(IxDyn(&[batch, max_patches, 768]), values)?)
+    Ok(Array::from_shape_vec(
+        IxDyn(&[batch, max_patches, 768]),
+        values,
+    )?)
 }
 
 fn stack_image_masks(images: &[ImageInputs]) -> Result<ArrayD<i32>> {
@@ -677,7 +735,10 @@ fn make_pos_embed_no_antialias(
     let source_width = 16usize;
     let channels = 768usize;
     if base_pos.len() != source_height * source_width * channels {
-        bail!("unexpected vision position embedding length: {}", base_pos.len());
+        bail!(
+            "unexpected vision position embedding length: {}",
+            base_pos.len()
+        );
     }
 
     let mut output = vec![0.0f32; max_patches * channels];
@@ -718,7 +779,10 @@ fn make_pos_embed_no_antialias(
         }
     }
 
-    Ok(Array::from_shape_vec(IxDyn(&[1, max_patches, channels]), output)?)
+    Ok(Array::from_shape_vec(
+        IxDyn(&[1, max_patches, channels]),
+        output,
+    )?)
 }
 
 fn linear_source_coordinate(output_index: usize, output_size: usize, input_size: usize) -> f32 {
@@ -759,8 +823,12 @@ fn report(name: &str, actual: &ArrayD<f32>, expected: &ArrayD<f32>) -> Result<()
             expected.shape()
         );
     }
-    let actual = actual.as_slice().context("actual output is not contiguous")?;
-    let expected = expected.as_slice().context("expected output is not contiguous")?;
+    let actual = actual
+        .as_slice()
+        .context("actual output is not contiguous")?;
+    let expected = expected
+        .as_slice()
+        .context("expected output is not contiguous")?;
     let max_abs_diff = actual
         .iter()
         .zip(expected)
@@ -819,7 +887,11 @@ fn read_i32_vec(path: &Path) -> Result<Vec<i32>> {
 fn read_pod_vec<T>(path: &Path, width: usize, decode: impl Fn(&[u8]) -> T) -> Result<Vec<T>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     if bytes.len() % width != 0 {
-        bail!("{} has {} bytes, not divisible by {width}", path.display(), bytes.len());
+        bail!(
+            "{} has {} bytes, not divisible by {width}",
+            path.display(),
+            bytes.len()
+        );
     }
     Ok(bytes.chunks_exact(width).map(decode).collect())
 }
@@ -834,7 +906,10 @@ fn write_f32_slice(path: &Path, values: &[f32]) -> Result<()> {
 }
 
 fn dump_array_f32(path: &Path, array: &ArrayD<f32>) -> Result<()> {
-    write_f32_slice(path, array.as_slice().context("f32 array is not contiguous")?)
+    write_f32_slice(
+        path,
+        array.as_slice().context("f32 array is not contiguous")?,
+    )
 }
 
 fn dump_array_i32(path: &Path, array: &ArrayD<i32>) -> Result<()> {

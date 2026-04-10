@@ -6,12 +6,14 @@ import os
 import sys
 from pathlib import Path
 
+import project_layout
+
 REPO_ID = "Qwen/Qwen3-VL-Embedding-2B"
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = project_layout.PROJECT_ROOT
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "images"
-DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "qwen3-vl-embedding-2b"
+DEFAULT_MODEL_DIR = project_layout.source_model_dir("qwen3-vl-embedding-2b")
 DEFAULT_INSTRUCTION = "Represent the user's input for retrieving relevant images."
-HF_CACHE_DIR = PROJECT_ROOT / ".hf-cache"
+HF_CACHE_DIR = project_layout.HF_CACHE_DIR
 
 os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
 os.environ.setdefault("HF_HUB_CACHE", str(HF_CACHE_DIR / "hub"))

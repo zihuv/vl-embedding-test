@@ -7,16 +7,17 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import project_layout
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_ONNX_DIR = PROJECT_ROOT / ".onnx-wrapper-test"
-DEFAULT_SOURCE_TEXT = DEFAULT_ONNX_DIR / "fgclip2_text_short_b1_s64.onnx"
-DEFAULT_SPLIT_TEXT = DEFAULT_ONNX_DIR / "split" / "fgclip2_text_short_b1_s64_token_embeds.onnx"
-DEFAULT_ASSET = DEFAULT_ONNX_DIR / "assets" / "text_token_embedding_256000x768_f16.bin"
-DEFAULT_BASE_MANIFEST = DEFAULT_ONNX_DIR / "fixtures" / "manifest.json"
-DEFAULT_SPLIT_MANIFEST = DEFAULT_ONNX_DIR / "fixtures" / "manifest_split_text.json"
-DEFAULT_REPORT = DEFAULT_ONNX_DIR / "split" / "split_text_embedding_report.json"
+FG_LAYOUT = project_layout.FGCLIP2_LAYOUT
+DEFAULT_SOURCE_TEXT = FG_LAYOUT.baseline_text_onnx_resolved
+DEFAULT_SPLIT_TEXT = FG_LAYOUT.split_text_onnx
+DEFAULT_ASSET = FG_LAYOUT.token_embedding_f16
+DEFAULT_BASE_MANIFEST = FG_LAYOUT.base_manifest_resolved
+DEFAULT_SPLIT_MANIFEST = FG_LAYOUT.split_manifest
+DEFAULT_REPORT = FG_LAYOUT.split_report
 
 TOKEN_EMBEDDING_INIT = "model.text_model.embeddings.token_embedding.weight"
 TOKEN_GATHER_NODE = "/text_model/embeddings/token_embedding/Gather"

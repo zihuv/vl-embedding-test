@@ -4,10 +4,12 @@ import argparse
 import os
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+import project_layout
+
+PROJECT_ROOT = project_layout.PROJECT_ROOT
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "images"
-DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "chinese-clip-vit-base-patch16"
-HF_CACHE_DIR = PROJECT_ROOT / ".hf-cache"
+DEFAULT_MODEL_DIR = project_layout.source_model_dir("chinese-clip-vit-base-patch16")
+HF_CACHE_DIR = project_layout.HF_CACHE_DIR
 
 os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
 os.environ.setdefault("HF_HUB_CACHE", str(HF_CACHE_DIR / "hub"))

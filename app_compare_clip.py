@@ -25,15 +25,23 @@ from transformers import ChineseCLIPModel, ChineseCLIPProcessor
 
 import demo_chinese_clip
 import demo_fg_clip2
+import ort_runtime
+import project_layout
 
-
-ONNX_TEST_DIR = PROJECT_ROOT / ".onnx-wrapper-test"
-FG_ONNX_SPLIT_TEXT = ONNX_TEST_DIR / "split" / "fgclip2_text_short_b1_s64_token_embeds.onnx"
-FG_ONNX_FP32_IMAGE = ONNX_TEST_DIR / "fgclip2_image_core_posin_dynamic.onnx"
-FG_ONNX_INT8_IMAGE = ONNX_TEST_DIR / "quantized" / "fgclip2_image_core_posin_dynamic_int8.onnx"
-FG_TOKEN_EMBEDDING_F16 = ONNX_TEST_DIR / "assets" / "text_token_embedding_256000x768_f16.bin"
-FG_VISION_POS_EMBEDDING = ONNX_TEST_DIR / "assets" / "vision_pos_embedding_16x16x768_f32.bin"
-FG_LOGIT_PARAMS = ONNX_TEST_DIR / "assets" / "logit_params.json"
+FG_LAYOUT = project_layout.FGCLIP2_LAYOUT
+FG_ONNX_SPLIT_TEXT = FG_LAYOUT.split_text_onnx_resolved
+FG_ONNX_FP32_IMAGE = FG_LAYOUT.baseline_image_onnx_resolved
+FG_ONNX_INT8_IMAGE = FG_LAYOUT.quantized_image_onnx_resolved
+FG_TOKEN_EMBEDDING_F16 = FG_LAYOUT.token_embedding_f16_resolved
+FG_VISION_POS_EMBEDDING = FG_LAYOUT.vision_pos_embedding_resolved
+FG_LOGIT_PARAMS = FG_LAYOUT.logit_params_resolved
+FG_ORT_BACKEND = os.environ.get("FGCLIP2_ORT_BACKEND", "auto")
+FG_ORT_PROVIDERS = os.environ.get("FGCLIP2_ORT_PROVIDERS")
+FG_ORT_COREML_CACHE_DIR = (
+    Path(os.environ["FGCLIP2_ORT_COREML_CACHE_DIR"])
+    if "FGCLIP2_ORT_COREML_CACHE_DIR" in os.environ
+    else None
+)
 
 
 @dataclass
@@ -192,18 +200,44 @@ class FgCLIP2OnnxSearcher:
         token_embedding: Path,
         vision_pos_embedding: Path,
         logit_params: Path,
+        provider_request: str,
+        coreml_cache_dir: Path | None,
     ) -> None:
+        try:
+            added_dll_dirs = ort_runtime.prepare_ort_environment(provider_request)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
         try:
             import onnxruntime as ort
         except ImportError as exc:
             raise SystemExit(
                 "onnxruntime is required for FG-CLIP2 ONNX comparison. "
-                "Run: uv run --with onnxruntime python app_compare_clip.py"
+                "Run: uv run --with onnxruntime python app_compare_clip.py "
+                "or uv run --with onnxruntime-gpu python app_compare_clip.py"
             ) from exc
+
+        try:
+            provider_selection = ort_runtime.resolve_ort_providers(
+                ort,
+                provider_request,
+                coreml_cache_dir=coreml_cache_dir,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
 
         print(f"Loading {self.name}:")
         print(f"  text ONNX:  {text_onnx}")
         print(f"  image ONNX: {image_onnx}")
+        print(f"  requested providers: {provider_selection.requested}")
+        print(f"  available providers: {', '.join(provider_selection.available_names)}")
+        print(f"  selected providers: {', '.join(provider_selection.selected_names)}")
+        if provider_selection.unavailable_names:
+            print(f"  unavailable requested providers: {', '.join(provider_selection.unavailable_names)}")
+        if added_dll_dirs:
+            print(f"  added CUDA DLL dirs: {', '.join(str(path) for path in added_dll_dirs)}")
+        if coreml_cache_dir is not None and "CoreMLExecutionProvider" in provider_selection.selected_names:
+            print(f"  CoreML cache dir: {coreml_cache_dir}")
         self.image_paths = image_paths
         self.batch_size = batch_size
         self.max_image_patches = max_image_patches
@@ -220,8 +254,18 @@ class FgCLIP2OnnxSearcher:
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         options.intra_op_num_threads = 4
-        self.text_session = ort.InferenceSession(str(text_onnx), sess_options=options, providers=["CPUExecutionProvider"])
-        self.image_session = ort.InferenceSession(str(image_onnx), sess_options=options, providers=["CPUExecutionProvider"])
+        self.text_session = ort.InferenceSession(
+            str(text_onnx),
+            sess_options=options,
+            providers=provider_selection.provider_args,
+        )
+        self.image_session = ort.InferenceSession(
+            str(image_onnx),
+            sess_options=options,
+            providers=provider_selection.provider_args,
+        )
+        print(f"  text session providers: {', '.join(self.text_session.get_providers())}")
+        print(f"  image session providers: {', '.join(self.image_session.get_providers())}")
 
         print(f"Pre-encoding images with {self.name}")
         self.image_features = self.encode_images(image_paths)
@@ -313,6 +357,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fg-onnx-max-image-patches", type=int, default=None)
     parser.add_argument("--fg-onnx-text", type=Path, default=FG_ONNX_SPLIT_TEXT)
     parser.add_argument("--fg-onnx-image", type=Path, default=None)
+    parser.add_argument(
+        "--fg-onnx-backend",
+        default=FG_ORT_BACKEND,
+        help="Backend profile: auto, cuda, cpu, coreml. Ignored when --fg-onnx-providers is set.",
+    )
+    parser.add_argument(
+        "--fg-onnx-providers",
+        default=FG_ORT_PROVIDERS,
+        help="Optional explicit ORT provider order. Examples: cuda,cpu or coreml,cpu. Overrides --fg-onnx-backend.",
+    )
+    parser.add_argument(
+        "--fg-onnx-coreml-cache-dir",
+        type=Path,
+        default=FG_ORT_COREML_CACHE_DIR,
+        help="Optional cache directory passed to CoreMLExecutionProvider when CoreML is selected.",
+    )
     parser.add_argument("--fg-token-embedding", type=Path, default=FG_TOKEN_EMBEDDING_F16)
     parser.add_argument("--fg-vision-pos-embedding", type=Path, default=FG_VISION_POS_EMBEDDING)
     parser.add_argument("--fg-logit-params", type=Path, default=FG_LOGIT_PARAMS)
@@ -580,7 +640,10 @@ def build_fg_onnx_searcher(
     if mode == "auto" and not python_package_available("onnxruntime"):
         print("Skipping FG-CLIP2 ONNX comparison; onnxruntime is not installed.")
         print("Run with: uv run --with onnxruntime python app_compare_clip.py")
+        print("For NVIDIA CUDA on Windows, use: uv run --with onnxruntime-gpu python app_compare_clip.py")
         return None
+
+    provider_request = args.fg_onnx_providers or args.fg_onnx_backend
 
     return FgCLIP2OnnxSearcher(
         image_paths=image_paths,
@@ -597,6 +660,8 @@ def build_fg_onnx_searcher(
         token_embedding=args.fg_token_embedding,
         vision_pos_embedding=args.fg_vision_pos_embedding,
         logit_params=args.fg_logit_params,
+        provider_request=provider_request,
+        coreml_cache_dir=args.fg_onnx_coreml_cache_dir,
     )
 
 

@@ -7,18 +7,19 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import project_layout
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_ONNX_DIR = PROJECT_ROOT / ".onnx-wrapper-test"
-DEFAULT_QUANT_DIR = DEFAULT_ONNX_DIR / "quantized"
-DEFAULT_FIXTURE_MANIFEST = DEFAULT_ONNX_DIR / "fixtures" / "manifest.json"
-DEFAULT_QUANT_MANIFEST = DEFAULT_ONNX_DIR / "fixtures" / "manifest_dynamic_int8.json"
+FG_LAYOUT = project_layout.FGCLIP2_LAYOUT
+DEFAULT_QUANT_DIR = FG_LAYOUT.runtime_quantized_dir
+DEFAULT_FIXTURE_MANIFEST = FG_LAYOUT.base_manifest_resolved
+DEFAULT_QUANT_MANIFEST = FG_LAYOUT.quant_manifest
 
-DEFAULT_TEXT_ONNX = DEFAULT_ONNX_DIR / "fgclip2_text_short_b1_s64.onnx"
-DEFAULT_IMAGE_ONNX = DEFAULT_ONNX_DIR / "fgclip2_image_core_posin_dynamic.onnx"
-DEFAULT_TEXT_QUANT_ONNX = DEFAULT_QUANT_DIR / "fgclip2_text_short_b1_s64_dynamic_int8.onnx"
-DEFAULT_IMAGE_QUANT_ONNX = DEFAULT_QUANT_DIR / "fgclip2_image_core_posin_dynamic_int8.onnx"
+DEFAULT_TEXT_ONNX = FG_LAYOUT.baseline_text_onnx_resolved
+DEFAULT_IMAGE_ONNX = FG_LAYOUT.baseline_image_onnx_resolved
+DEFAULT_TEXT_QUANT_ONNX = FG_LAYOUT.quantized_text_onnx
+DEFAULT_IMAGE_QUANT_ONNX = FG_LAYOUT.quantized_image_onnx
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-output", type=Path, default=DEFAULT_IMAGE_QUANT_ONNX)
     parser.add_argument("--fixture-manifest", type=Path, default=DEFAULT_FIXTURE_MANIFEST)
     parser.add_argument("--quant-manifest", type=Path, default=DEFAULT_QUANT_MANIFEST)
-    parser.add_argument("--report-json", type=Path, default=DEFAULT_QUANT_DIR / "dynamic_int8_report.json")
+    parser.add_argument("--report-json", type=Path, default=FG_LAYOUT.quant_report)
     parser.add_argument("--op-type", action="append", dest="op_types", default=None)
     parser.add_argument(
         "--profile",
