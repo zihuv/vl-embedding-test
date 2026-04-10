@@ -1,5 +1,13 @@
 chinese clip vs fg-clip2 你知道吗？
 
+## 前言&鸣谢
+
+- 基于360的 [fgclip2](https://github.com/360CVGroup/FG-CLIP) 导出的onnx模型，使用split-text降低运行时内存开销
+- 简单比较了以下模型在文搜图的效果。通过个人简单主观测试，认为fgclip2是在中文场景中表现比较好
+  - [fgclip2](https://github.com/360CVGroup/FG-CLIP)
+  - [Qwen3-VL-Embedding](https://github.com/QwenLM/Qwen3-VL-Embedding)
+  - [Chinese-CLIP](https://github.com/OFA-Sys/Chinese-CLIP)
+
 ## VL embedding demos
 
 三个脚本都会在第一次运行时把模型下载到项目内的 `models/`，然后用自然语言检索 `images/` 里的本地图片。
