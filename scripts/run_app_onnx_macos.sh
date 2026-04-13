@@ -10,24 +10,22 @@ EXTRA_ORT_ARGS=()
 
 if [[ -n "${FGCLIP2_ORT_PROVIDERS:-}" ]]; then
   PROVIDERS="$FGCLIP2_ORT_PROVIDERS"
-  EXTRA_ORT_ARGS+=(--fg-onnx-providers "$PROVIDERS")
+  EXTRA_ORT_ARGS+=(--onnx-providers "$PROVIDERS")
   echo "Launching app_compare_clip.py with ORT providers: $PROVIDERS"
 else
   echo "Launching app_compare_clip.py with ORT backend profile: $BACKEND"
 fi
 
-if python -c "import gradio, numpy, onnxruntime, torch, transformers" >/dev/null 2>&1; then
+if python -c "import gradio, numpy, onnxruntime, transformers" >/dev/null 2>&1; then
   exec python app_compare_clip.py \
-    --fg-onnx-mode split-text \
-    --fg-onnx-backend "$BACKEND" \
+    --onnx-backend "$BACKEND" \
     "${EXTRA_ORT_ARGS[@]}" \
-    --fg-onnx-coreml-cache-dir "$COREML_CACHE_DIR" \
+    --onnx-coreml-cache-dir "$COREML_CACHE_DIR" \
     "$@"
 fi
 
 exec uv run --with onnxruntime python app_compare_clip.py \
-  --fg-onnx-mode split-text \
-  --fg-onnx-backend "$BACKEND" \
+  --onnx-backend "$BACKEND" \
   "${EXTRA_ORT_ARGS[@]}" \
-  --fg-onnx-coreml-cache-dir "$COREML_CACHE_DIR" \
+  --onnx-coreml-cache-dir "$COREML_CACHE_DIR" \
   "$@"

@@ -39,7 +39,7 @@ if ($env:FGCLIP2_ORT_DLL_PATHS) {
 }
 
 & uv run --with onnxruntime-gpu python .\app_compare_clip.py `
-    --fg-onnx-mode split-text `
+    --onnx-backend $Backend `
     --server-name $ServerName `
     --server-port $ServerPort `
     @ExtraArgs

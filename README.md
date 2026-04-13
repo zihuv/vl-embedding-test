@@ -32,52 +32,51 @@ uv run python demo_fg_clip2.py "山" --top-k 5
 uv run python demo_qwen3_vl_embedding.py "山" --top-k 3 --batch-size 1
 ```
 
-当前 demo 是单模型、终端排序版。后面可以把三份排序结果接到同一个 Gradio 页面里。
+当前 demo 脚本仍然是单模型、终端排序版；多模型对照页见下面的 Gradio 页面。
 
 Gradio 对照页面：
-
-```powershell
-uv run python app_compare_clip.py
-```
-
-默认会在启动时加载 Chinese-CLIP 和 FG-CLIP2，并把 `images/` 预编码到内存。打开终端里打印的本地地址，然后输入自然语言搜索。
-
-如果已经导出 FG-CLIP2 ONNX / split-text 资产，可以加上 ONNX Runtime 依赖。页面会自动多出第三列 `FG-CLIP2 ONNX / split-text`：
 
 ```powershell
 uv run --with onnxruntime python app_compare_clip.py
 ```
 
-现在 `FG-CLIP2 ONNX / split-text` 支持配置 ORT provider 顺序：
+现在 `app_compare_clip.py` 默认是纯 ONNX 对照页，会同时加载：
+
+- `Chinese-CLIP ONNX`
+- `FG-CLIP2 ONNX p256`
+- `FG-CLIP2 ONNX p128`
+
+三列都会在启动时把 `images/` 预编码到内存。分数统一显示为归一化 embedding 的 cosine，便于横向对比排序和相似度。`FG-CLIP2` 的多列复用同一套 ONNX，只是在预处理阶段使用不同 `max_patches`。
+
+如果你想改 FG-CLIP2 的 patch budget 组合：
 
 ```powershell
-uv run --with onnxruntime-gpu python app_compare_clip.py --fg-onnx-mode split-text --fg-onnx-providers cuda,cpu
-uv run --with onnxruntime python app_compare_clip.py --fg-onnx-mode split-text --fg-onnx-providers cpu
+uv run --with onnxruntime python app_compare_clip.py --fg-patch-variants 576,256,128
+```
+
+ORT provider 顺序支持显式指定：
+
+```powershell
+uv run --with onnxruntime-gpu python app_compare_clip.py --onnx-providers cuda,cpu
+uv run --with onnxruntime python app_compare_clip.py --onnx-providers cpu
 ```
 
 也支持更简单的 backend profile：
 
 ```powershell
-uv run --with onnxruntime-gpu python app_compare_clip.py --fg-onnx-mode split-text --fg-onnx-backend auto
-uv run --with onnxruntime-gpu python app_compare_clip.py --fg-onnx-mode split-text --fg-onnx-backend cuda
-uv run --with onnxruntime-gpu python app_compare_clip.py --fg-onnx-mode split-text --fg-onnx-backend cpu
+uv run --with onnxruntime-gpu python app_compare_clip.py --onnx-backend auto
+uv run --with onnxruntime-gpu python app_compare_clip.py --onnx-backend cuda
+uv run --with onnxruntime-gpu python app_compare_clip.py --onnx-backend cpu
 ```
 
 优先级规则：
 
-- 如果设置了 `--fg-onnx-providers` 或环境变量 `FGCLIP2_ORT_PROVIDERS`，就按显式 provider 顺序走
-- 否则看 `--fg-onnx-backend` 或环境变量 `FGCLIP2_ORT_BACKEND`
+- 如果设置了 `--onnx-providers` 或环境变量 `FGCLIP2_ORT_PROVIDERS`，就按显式 provider 顺序走
+- 否则看 `--onnx-backend` 或环境变量 `FGCLIP2_ORT_BACKEND`
 - 如果两者都没指定，默认是 `auto`
 - `auto` 在 Windows 上默认等于 `cuda,cpu`
 - `auto` 在 macOS 上默认等于 `coreml,cpu`
 - `auto` 在其他平台上默认等于 `cpu`
-
-强制打开第三列，或测试最低内存实验版：
-
-```powershell
-uv run --with onnxruntime python app_compare_clip.py --fg-onnx-mode split-text
-uv run --with onnxruntime python app_compare_clip.py --fg-onnx-mode lowmem
-```
 
 FG-CLIP2 ONNX 的文件组成、输入输出约定、推荐运行模式和命令示例见
 `docs/fgclip2-onnx-usage.md`。
@@ -91,10 +90,10 @@ uv run python .\scripts\migrate_fgclip2_layout.py --apply
 
 如果启动后又往 `images/` 放了新图，点页面上的“刷新图片”。它会增量编码新文件；已有图片会复用内存里的向量。
 
-CPU 机器上可以先降低 FG-CLIP2 的图片 patch 数：
+CPU 机器上可以先降低 FG-CLIP2 的 patch budget 或减小 batch：
 
 ```powershell
-uv run python app_compare_clip.py --fg-max-image-patches 256 --fg-batch-size 1
+uv run --with onnxruntime python app_compare_clip.py --fg-patch-variants 256,128 --fg-batch-size 1
 ```
 
 一键脚本：
@@ -103,14 +102,14 @@ uv run python app_compare_clip.py --fg-max-image-patches 256 --fg-batch-size 1
 .\scripts\run_app_onnx_cuda.ps1
 .\scripts\run_app_onnx_cuda.ps1 -Backend cuda
 .\scripts\run_app_onnx_cuda.ps1 -Backend cpu
-.\scripts\run_app_onnx_cuda.ps1 -OnnxProviders cuda,cpu -ExtraArgs @("--fg-onnx-max-image-patches", "576")
+.\scripts\run_app_onnx_cuda.ps1 -OnnxProviders cuda,cpu -ExtraArgs @("--fg-patch-variants", "576,256")
 ```
 
 ```bash
 chmod +x ./scripts/run_app_onnx_macos.sh
 ./scripts/run_app_onnx_macos.sh
 FGCLIP2_ORT_BACKEND=coreml ./scripts/run_app_onnx_macos.sh
-FGCLIP2_ORT_PROVIDERS=coreml,cpu ./scripts/run_app_onnx_macos.sh --fg-onnx-max-image-patches 576
+FGCLIP2_ORT_PROVIDERS=coreml,cpu ./scripts/run_app_onnx_macos.sh --fg-patch-variants 576,256
 ```
 
 macOS 脚本会优先尝试 `CoreMLExecutionProvider`，找不到时自动回退到 `CPUExecutionProvider`。如果你要真正跑 CoreML，需要使用暴露了 `CoreMLExecutionProvider` 的 ONNX Runtime Python 环境；默认 `uv run --with onnxruntime` 这条路径更适合作为 CPU fallback。
@@ -119,7 +118,7 @@ Windows 上如果要走 NVIDIA CUDA，建议直接用：
 
 ```powershell
 $env:FGCLIP2_ORT_BACKEND = "cuda"
-uv run --with onnxruntime-gpu python app_compare_clip.py --fg-onnx-mode split-text
+uv run --with onnxruntime-gpu python app_compare_clip.py
 ```
 
 如果 `CUDAExecutionProvider` 能看到但 session 还是回退到 CPU，通常是 CUDA / cuDNN DLL 搜索路径问题。可以显式指定：

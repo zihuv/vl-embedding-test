@@ -19,6 +19,39 @@ def source_model_dir(model_name: str) -> Path:
 
 
 @dataclass(frozen=True)
+class ChineseClipLayout:
+    preferred_root: Path = ARTIFACTS_ROOT / "chinese-clip-vit-base-patch16"
+
+    @property
+    def onnx_root(self) -> Path:
+        return self.preferred_root / "onnx"
+
+    @property
+    def export_manifest(self) -> Path:
+        return self.onnx_root / "export_manifest.json"
+
+    @property
+    def export_manifest_resolved(self) -> Path:
+        return self.export_manifest
+
+    @property
+    def text_onnx(self) -> Path:
+        return self.onnx_root / "vit-b-16.txt.fp32.onnx"
+
+    @property
+    def text_onnx_resolved(self) -> Path:
+        return self.text_onnx
+
+    @property
+    def image_onnx(self) -> Path:
+        return self.onnx_root / "vit-b-16.img.fp32.onnx"
+
+    @property
+    def image_onnx_resolved(self) -> Path:
+        return self.image_onnx
+
+
+@dataclass(frozen=True)
 class FgClip2Layout:
     preferred_root: Path = ARTIFACTS_ROOT / "fgclip2"
 
@@ -177,3 +210,4 @@ class FgClip2Layout:
 
 
 FGCLIP2_LAYOUT = FgClip2Layout()
+CHINESE_CLIP_LAYOUT = ChineseClipLayout()
